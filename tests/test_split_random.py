@@ -18,7 +18,6 @@ def test_deterministic_diff_seed():
     df = pd.DataFrame({"x": range(100), "y": [0] * 80 + [1] * 20})
     r1 = split(df, target="y", seed=1)
     r2 = split(df, target="y", seed=2)
-    # Very likely different; assert not all equal
     assert not (
         np.array_equal(r1.train_idx, r2.train_idx)
         and np.array_equal(r1.val_idx, r2.val_idx)
@@ -56,7 +55,7 @@ def test_sizes_sum_and_minimums():
 
 def test_stratification_preserves_classes():
     df = pd.DataFrame({"x": range(100), "y": [0] * 80 + [1] * 20})
-    r = split(df, target="y", seed=42)  # stratify auto
+    r = split(df, target="y", seed=42)
 
     y = df["y"]
     overall_p1 = (y == 1).mean()
@@ -64,12 +63,10 @@ def test_stratification_preserves_classes():
     p1_val = (y.iloc[r.val_idx] == 1).mean()
     p1_test = (y.iloc[r.test_idx] == 1).mean()
 
-    # each split should have both classes
     assert set(y.iloc[r.train_idx].unique()) == {0, 1}
     assert set(y.iloc[r.val_idx].unique()) == {0, 1}
     assert set(y.iloc[r.test_idx].unique()) == {0, 1}
 
-    # proportions roughly match overall
     assert abs(p1_train - overall_p1) <= 0.1
     assert abs(p1_val - overall_p1) <= 0.1
     assert abs(p1_test - overall_p1) <= 0.1
@@ -81,15 +78,7 @@ def test_stratification_too_few_samples_raises():
         split(df, target="y", seed=0, stratify=True)
 
 
-def test_strategy_not_implemented():
+def test_unknown_strategy_raises():
     df = pd.DataFrame({"x": range(10), "y": [0, 1] * 5})
-    with pytest.raises(NotImplementedError):
-        split(df, target="y", strategy="time")
-
-
-def test_groups_timecol_not_implemented():
-    df = pd.DataFrame({"x": range(10), "y": [0, 1] * 5, "t": range(10), "g": list("aaaaaaaaaa")})
-    with pytest.raises(NotImplementedError):
-        split(df, target="y", groups="g")
-    with pytest.raises(NotImplementedError):
-        split(df, target="y", time_col="t")
+    with pytest.raises(ValueError, match="Unknown strategy"):
+        split(df, target="y", strategy="bogus")

@@ -11,7 +11,6 @@ def _validate_and_normalize_sizes(n: int, ratios) -> tuple[int, int, int]:
 
     sizes = [train_size, val_size, test_size]
 
-    # Ensure each split has at least 1 sample (for n >= 3)
     while any(s == 0 for s in sizes):
         largest = sizes.index(max(sizes))
         smallest = sizes.index(min(sizes))
@@ -23,51 +22,13 @@ def _validate_and_normalize_sizes(n: int, ratios) -> tuple[int, int, int]:
     return sizes[0], sizes[1], sizes[2]
 
 
-def split(
-    df,
-    target: str,
-    groups=None,
-    time_col=None,
-    strategy: str = "random",
-    ratios=(0.7, 0.15, 0.15),
-    seed: int = 42,
-    stratify: bool | None = None,
-) -> SplitResult:
-    # Basic validations
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError("df must be a pandas DataFrame")
-
-    if target not in df.columns:
-        raise KeyError(f"target column '{target}' not found in dataframe")
-
-    if not isinstance(ratios, (tuple, list)) or len(ratios) != 3:
-        raise ValueError("ratios must have length 3 (train, val, test)")
-
-    if any(r <= 0 for r in ratios):
-        raise ValueError("all ratios must be > 0")
-
-    if abs(sum(ratios) - 1.0) > 1e-6:
-        raise ValueError("ratios must sum to 1")
-
-    if not isinstance(seed, int):
-        raise TypeError("seed must be an integer")
-
+def _random_split(df, target, ratios, seed, stratify):
+    """Random (optionally stratified) train/val/test split."""
     n = len(df)
-    if n < 3:
-        raise ValueError("dataset must have at least 3 rows")
-
-    if strategy != "random":
-        raise NotImplementedError("Only 'random' strategy is supported in v0.1")
-
-    if groups is not None or time_col is not None:
-        raise NotImplementedError("groups and time_col not supported in v0.1")
-
     rng = np.random.default_rng(seed)
 
-    # Compute global split sizes (used for non-stratified case + metadata)
     train_size, val_size, test_size = _validate_and_normalize_sizes(n, ratios)
 
-    # Decide whether to stratify
     y = df[target]
     nunique = int(y.nunique(dropna=False))
     categorical_like = (
@@ -88,20 +49,16 @@ def split(
             )
 
     if not do_stratify:
-        # Plain random split
         indices = np.arange(n, dtype=int)
         rng.shuffle(indices)
-
         train_idx = indices[:train_size]
         val_idx = indices[train_size : train_size + val_size]
         test_idx = indices[train_size + val_size :]
     else:
-        # Stratified split: split indices within each class label then combine
         train_parts = []
         val_parts = []
         test_parts = []
 
-        # groupby on the target values; preserves exact label sets present in y
         for label, idxs in y.groupby(y, dropna=False).groups.items():
             idxs = np.asarray(list(idxs), dtype=int)
             rng.shuffle(idxs)
@@ -113,7 +70,6 @@ def split(
                 )
 
             t, v, te = _validate_and_normalize_sizes(k, ratios)
-
             train_parts.append(idxs[:t])
             val_parts.append(idxs[t : t + v])
             test_parts.append(idxs[t + v :])
@@ -122,12 +78,10 @@ def split(
         val_idx = np.concatenate(val_parts).astype(int, copy=False)
         test_idx = np.concatenate(test_parts).astype(int, copy=False)
 
-        # Shuffle within each split to remove label blocks (still deterministic)
         rng.shuffle(train_idx)
         rng.shuffle(val_idx)
         rng.shuffle(test_idx)
 
-        # Safety checks
         all_idx = np.concatenate([train_idx, val_idx, test_idx])
         if len(np.unique(all_idx)) != n:
             raise RuntimeError("Internal error: stratified split produced overlap or missing indices.")
@@ -152,9 +106,194 @@ def split(
         metadata["target_counts_val"] = {k: int(v) for k, v in y.iloc[val_idx].value_counts(dropna=False).to_dict().items()}
         metadata["target_counts_test"] = {k: int(v) for k, v in y.iloc[test_idx].value_counts(dropna=False).to_dict().items()}
 
-    return SplitResult(
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=test_idx,
-        metadata=metadata,
-    )
+    return SplitResult(train_idx=train_idx, val_idx=val_idx, test_idx=test_idx, metadata=metadata)
+
+
+def _group_split(df, groups, ratios, seed):
+    """Split by group — no group appears in more than one split."""
+    unique_groups = np.asarray(df[groups].unique())
+    n_groups = len(unique_groups)
+
+    if n_groups < 3:
+        raise ValueError(f"Need at least 3 unique groups, got {n_groups}")
+
+    rng = np.random.default_rng(seed)
+    shuffled = unique_groups.copy()
+    rng.shuffle(shuffled)
+
+    train_n, val_n, test_n = _validate_and_normalize_sizes(n_groups, ratios)
+
+    train_groups = set(shuffled[:train_n].tolist())
+    val_groups = set(shuffled[train_n : train_n + val_n].tolist())
+    test_groups = set(shuffled[train_n + val_n :].tolist())
+
+    group_col = df[groups]
+    train_idx = np.where(group_col.isin(train_groups))[0].astype(int)
+    val_idx = np.where(group_col.isin(val_groups))[0].astype(int)
+    test_idx = np.where(group_col.isin(test_groups))[0].astype(int)
+
+    metadata = {
+        "strategy": "group",
+        "ratios": tuple(ratios),
+        "seed": seed,
+        "n_rows": len(df),
+        "split_sizes": {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)},
+        "n_groups": n_groups,
+        "groups_per_split": {"train": train_n, "val": val_n, "test": test_n},
+    }
+
+    return SplitResult(train_idx=train_idx, val_idx=val_idx, test_idx=test_idx, metadata=metadata)
+
+
+def _time_split(df, time_col, ratios, seed):
+    """Chronological split — train is earliest, test is latest."""
+    n = len(df)
+    time_series = pd.to_datetime(df[time_col])
+    sorted_idx = np.argsort(time_series.values, kind="stable").astype(int)
+
+    train_n, val_n, test_n = _validate_and_normalize_sizes(n, ratios)
+
+    train_idx = sorted_idx[:train_n]
+    val_idx = sorted_idx[train_n : train_n + val_n]
+    test_idx = sorted_idx[train_n + val_n :]
+
+    train_times = time_series.iloc[train_idx]
+    val_times = time_series.iloc[val_idx]
+    test_times = time_series.iloc[test_idx]
+
+    metadata = {
+        "strategy": "time",
+        "ratios": tuple(ratios),
+        "seed": seed,
+        "n_rows": n,
+        "split_sizes": {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)},
+        "time_range": {
+            "train_min": train_times.min().isoformat(),
+            "train_max": train_times.max().isoformat(),
+            "val_min": val_times.min().isoformat(),
+            "val_max": val_times.max().isoformat(),
+            "test_min": test_times.min().isoformat(),
+            "test_max": test_times.max().isoformat(),
+        },
+    }
+
+    return SplitResult(train_idx=train_idx, val_idx=val_idx, test_idx=test_idx, metadata=metadata)
+
+
+def _group_time_split(df, groups, time_col, ratios, seed):
+    """Split groups by their latest timestamp — prevents entity + time leakage."""
+    time_series = pd.to_datetime(df[time_col])
+    max_times = time_series.groupby(df[groups]).max()
+
+    group_order = pd.DataFrame({"group": max_times.index, "max_time": max_times.values})
+    group_order = group_order.sort_values(["max_time", "group"], kind="mergesort")
+    sorted_groups = group_order["group"].values
+
+    n_groups = len(sorted_groups)
+    if n_groups < 3:
+        raise ValueError(f"Need at least 3 unique groups, got {n_groups}")
+
+    train_n, val_n, test_n = _validate_and_normalize_sizes(n_groups, ratios)
+
+    train_groups = set(sorted_groups[:train_n].tolist())
+    val_groups = set(sorted_groups[train_n : train_n + val_n].tolist())
+    test_groups = set(sorted_groups[train_n + val_n :].tolist())
+
+    group_col = df[groups]
+    train_idx = np.where(group_col.isin(train_groups))[0].astype(int)
+    val_idx = np.where(group_col.isin(val_groups))[0].astype(int)
+    test_idx = np.where(group_col.isin(test_groups))[0].astype(int)
+
+    train_times = time_series.iloc[train_idx]
+    val_times = time_series.iloc[val_idx]
+    test_times = time_series.iloc[test_idx]
+
+    metadata = {
+        "strategy": "group_time",
+        "ratios": tuple(ratios),
+        "seed": seed,
+        "n_rows": len(df),
+        "split_sizes": {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)},
+        "n_groups": n_groups,
+        "groups_per_split": {"train": train_n, "val": val_n, "test": test_n},
+        "time_range": {
+            "train_min": train_times.min().isoformat(),
+            "train_max": train_times.max().isoformat(),
+            "val_min": val_times.min().isoformat(),
+            "val_max": val_times.max().isoformat(),
+            "test_min": test_times.min().isoformat(),
+            "test_max": test_times.max().isoformat(),
+        },
+    }
+
+    return SplitResult(train_idx=train_idx, val_idx=val_idx, test_idx=test_idx, metadata=metadata)
+
+
+def split(
+    df,
+    target: str,
+    groups=None,
+    time_col=None,
+    strategy: str = "random",
+    ratios=(0.7, 0.15, 0.15),
+    seed: int = 42,
+    stratify: bool | None = None,
+) -> SplitResult:
+    # --- Input validation ---
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("df must be a pandas DataFrame")
+
+    if target not in df.columns:
+        raise KeyError(f"target column '{target}' not found in dataframe")
+
+    if not isinstance(ratios, (tuple, list)) or len(ratios) != 3:
+        raise ValueError("ratios must have length 3 (train, val, test)")
+
+    if any(r <= 0 for r in ratios):
+        raise ValueError("all ratios must be > 0")
+
+    if abs(sum(ratios) - 1.0) > 1e-6:
+        raise ValueError("ratios must sum to 1")
+
+    if not isinstance(seed, int):
+        raise TypeError("seed must be an integer")
+
+    n = len(df)
+    if n < 3:
+        raise ValueError("dataset must have at least 3 rows")
+
+    # --- Strategy dispatch ---
+    if strategy == "random":
+        return _random_split(df, target, ratios, seed, stratify)
+
+    elif strategy == "group":
+        if stratify is True:
+            raise NotImplementedError("Stratified group splitting not yet supported")
+        if groups is None:
+            raise ValueError("groups parameter is required when strategy='group'")
+        if groups not in df.columns:
+            raise ValueError(f"groups column '{groups}' not found in dataframe")
+        return _group_split(df, groups, ratios, seed)
+
+    elif strategy == "time":
+        if stratify is True:
+            raise NotImplementedError("Stratified time splitting not yet supported")
+        if time_col is None:
+            raise ValueError("time_col parameter is required when strategy='time'")
+        if time_col not in df.columns:
+            raise ValueError(f"time_col column '{time_col}' not found in dataframe")
+        return _time_split(df, time_col, ratios, seed)
+
+    elif strategy == "group_time":
+        if stratify is True:
+            raise NotImplementedError("Stratified group_time splitting not yet supported")
+        if groups is None or time_col is None:
+            raise ValueError("Both groups and time_col are required when strategy='group_time'")
+        if groups not in df.columns:
+            raise ValueError(f"groups column '{groups}' not found in dataframe")
+        if time_col not in df.columns:
+            raise ValueError(f"time_col column '{time_col}' not found in dataframe")
+        return _group_time_split(df, groups, time_col, ratios, seed)
+
+    else:
+        raise ValueError(f"Unknown strategy: {strategy!r}. Choose from: random, group, time, group_time")
