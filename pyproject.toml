@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "ML dataset splitting with built-in leakage detection"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors = [
     {name = "Shikhar Shukla"},
 ]
