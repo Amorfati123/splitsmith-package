@@ -1,3 +1,4 @@
-from .types import SplitResult, LeakageReport, Finding
+from .types import SplitResult, LeakageReport, Finding, FoldResult, CVResult
 from .split import split
-from .audit import audit
+from .cv import k_fold
+from .audit import audit, audit_cv, audit_cv_summary

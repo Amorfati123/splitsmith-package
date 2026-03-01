@@ -49,3 +49,33 @@ class LeakageReport:
     def __repr__(self) -> str:
         counts = self.summary()
         return f"LeakageReport({counts['error']} error, {counts['warn']} warn, {counts['info']} info)"
+
+
+@dataclass
+class FoldResult:
+    """Result of a single CV fold."""
+    fold: int
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CVResult:
+    """Result of k-fold cross-validation."""
+    folds: List[FoldResult]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def k(self) -> int:
+        return len(self.folds)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "k": self.k,
+            "fold_sizes": [
+                {"train": len(f.train_idx), "val": len(f.val_idx)}
+                for f in self.folds
+            ],
+            **self.metadata,
+        }
