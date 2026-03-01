@@ -41,3 +41,11 @@ class LeakageReport:
             if f.severity in counts:
                 counts[f.severity] += 1
         return counts
+
+    @property
+    def ok(self) -> bool:
+        return all(f.severity != "error" for f in self.findings)
+
+    def __repr__(self) -> str:
+        counts = self.summary()
+        return f"LeakageReport({counts['error']} error, {counts['warn']} warn, {counts['info']} info)"
