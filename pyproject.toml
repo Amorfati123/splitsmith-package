@@ -19,12 +19,14 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "numpy>=1.24",
@@ -39,6 +41,8 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/Amorfati123/splitsmith-v0.1"
 Repository = "https://github.com/Amorfati123/splitsmith-v0.1"
+Issues = "https://github.com/Amorfati123/splitsmith-v0.1/issues"
+Documentation = "https://github.com/Amorfati123/splitsmith-v0.1#readme"
 
 [tool.setuptools.packages.find]
 include = ["splitsmith*"]

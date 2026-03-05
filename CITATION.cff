@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "splitsmith"
+version: "0.1.0"
+date-released: "2026-03-04"
+license: MIT
+repository-code: "https://github.com/Amorfati123/splitsmith-v0.1"
+keywords:
+  - machine-learning
+  - data-splitting
+  - leakage-detection
+  - cross-validation
+  - Python
+authors:
+  - family-names: Shukla
+    given-names: Shikhar
+    orcid: "https://orcid.org/0009-0003-8941-3396"
+abstract: >-
+  splitsmith is a Python library that combines dataset splitting and leakage
+  auditing into a single workflow for machine learning. It provides
+  train/validation/test splitting and k-fold cross-validation with four
+  strategies (random, group, time, group-time) while automatically checking
+  for index overlap, duplicate rows, entity leakage, and temporal leakage.
