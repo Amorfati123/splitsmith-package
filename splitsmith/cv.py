@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .types import CVResult, FoldResult
+from ._meta import build_metadata
 
 
 _VALID_STRATEGIES = ("basic", "stratified", "group", "time", "group_time")
@@ -34,16 +35,10 @@ def k_fold(
     strategy : "basic", "stratified", "group", "time", or "group_time"
     groups : column name for group-aware strategies
     time_col : column name for time-aware strategies
-    seed : random seed for determinism
-    gap : number of rows (or groups) to drop between train and val
-        in time-aware CV (embargo/purge window)
-    embargo : alias for gap; if both given, max is used
-
-    Returns
-    -------
-    CVResult
+    seed : random seed
+    gap : rows/groups to drop between train and val in time-aware CV
+    embargo : alias for gap
     """
-    # --- Validation ---
     if not isinstance(df, pd.DataFrame):
         raise TypeError("df must be a pandas DataFrame")
     if target not in df.columns:
@@ -90,10 +85,9 @@ def k_fold(
         if n_groups < (k + 1):
             raise ValueError(f"group_time strategy requires at least k+1 unique groups, got {n_groups}, k={k}")
 
-    # --- Dispatch ---
     if strategy == "basic":
         folds = _basic_folds(n, k, seed)
-        meta = {"strategy": "basic", "k": k, "seed": seed, "n_rows": n}
+        meta: Dict[str, Any] = {"strategy": "basic", "k": k, "seed": seed, "n_rows": n}
 
     elif strategy == "stratified":
         folds = _stratified_folds(df, target, k, seed)
@@ -114,19 +108,81 @@ def k_fold(
             "gap": effective_gap, "time_range": time_range,
         }
 
-    else:  # group_time
+    else:
         folds, ng = _group_time_folds(df, groups, time_col, k, seed, effective_gap)
         meta = {
             "strategy": "group_time", "k": k, "seed": seed, "n_rows": n,
             "gap": effective_gap, "n_groups": ng,
         }
 
+    # Attach reproducibility metadata
+    params = {
+        "target": target, "k": k, "strategy": strategy,
+        "groups": groups, "time_col": time_col,
+        "seed": seed, "gap": gap, "embargo": embargo,
+    }
+    meta["reproducibility"] = build_metadata(df, params)
+
     return CVResult(folds=folds, metadata=meta)
 
 
-# ---------------------------------------------------------------------------
-# Strategy implementations
-# ---------------------------------------------------------------------------
+def repeated_k_fold(
+    df: pd.DataFrame,
+    target: str,
+    n_repeats: int = 5,
+    k: int = 5,
+    strategy: str = "basic",
+    groups: Optional[str] = None,
+    time_col: Optional[str] = None,
+    seed: int = 42,
+    gap: int = 0,
+    embargo: int = 0,
+) -> Dict[str, Any]:
+    """Run k-fold CV multiple times with different seeds and summarize stability.
+
+    Returns a dict with:
+        results: list of CVResult objects
+        summary: fold-size variance and consistency stats across repeats
+    """
+    if not isinstance(n_repeats, int) or n_repeats < 1:
+        raise ValueError("n_repeats must be a positive integer")
+
+    results: List[CVResult] = []
+    for i in range(n_repeats):
+        cv = k_fold(
+            df, target=target, k=k, strategy=strategy,
+            groups=groups, time_col=time_col,
+            seed=seed + i, gap=gap, embargo=embargo,
+        )
+        results.append(cv)
+
+    # Summarize fold sizes across repeats
+    all_train_sizes = []
+    all_val_sizes = []
+    for cv in results:
+        for fold in cv.folds:
+            all_train_sizes.append(len(fold.train_idx))
+            all_val_sizes.append(len(fold.val_idx))
+
+    summary: Dict[str, Any] = {
+        "n_repeats": n_repeats,
+        "k": k,
+        "strategy": strategy,
+        "seed_range": [seed, seed + n_repeats - 1],
+        "train_fold_size": {
+            "mean": float(np.mean(all_train_sizes)),
+            "std": float(np.std(all_train_sizes)),
+        },
+        "val_fold_size": {
+            "mean": float(np.mean(all_val_sizes)),
+            "std": float(np.std(all_val_sizes)),
+        },
+    }
+
+    return {"results": results, "summary": summary}
+
+
+# Fold-generation functions (used by both k_fold and compat.py)
 
 def _basic_folds(n: int, k: int, seed: int) -> List[FoldResult]:
     rng = np.random.default_rng(seed)
@@ -208,11 +264,7 @@ def _iso_range(values: pd.Series) -> Dict[str, str]:
 def _time_folds(
     df: pd.DataFrame, time_col: str, k: int, seed: int, gap: int = 0,
 ) -> Tuple[List[FoldResult], Dict[str, str]]:
-    """Forward-chaining: train grows each fold, val is always the next block.
-
-    With gap > 0, *gap* rows are dropped between the end of train and the
-    start of val in each fold (embargo / purge window).
-    """
+    """Forward-chaining with optional gap between train and val."""
     time_series = pd.to_datetime(df[time_col])
     sorted_idx = np.argsort(time_series.values, kind="stable").astype(int)
     row_blocks = [b.astype(int, copy=False) for b in np.array_split(sorted_idx, k + 1)]
@@ -222,7 +274,6 @@ def _time_folds(
         train_idx = np.concatenate(row_blocks[: i + 1]).astype(int, copy=False)
         val_idx = row_blocks[i + 1]
 
-        # Apply gap: drop the last `gap` rows from train
         if gap > 0 and len(train_idx) > gap:
             train_idx = train_idx[:-gap]
 
@@ -241,11 +292,7 @@ def _time_folds(
 def _group_time_folds(
     df: pd.DataFrame, groups: str, time_col: str, k: int, seed: int, gap: int = 0,
 ) -> Tuple[List[FoldResult], int]:
-    """Forward-chaining on groups sorted by their max timestamp.
-
-    With gap > 0, the last `gap` groups from the training set are dropped
-    in each fold to create an embargo window.
-    """
+    """Forward-chaining on groups sorted by max timestamp, with optional gap."""
     time_series = pd.to_datetime(df[time_col])
     max_times = time_series.groupby(df[groups]).max()
 
@@ -261,7 +308,6 @@ def _group_time_folds(
         all_train_groups = [g for block in group_blocks[: i + 1] for g in block]
         val_groups_list = group_blocks[i + 1]
 
-        # Apply gap: drop the last `gap` groups from training
         if gap > 0 and len(all_train_groups) > gap:
             all_train_groups = all_train_groups[:-gap]
 
