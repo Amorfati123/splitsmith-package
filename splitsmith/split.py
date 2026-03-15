@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 from .types import SplitResult
+from ._meta import build_metadata
 
 
 def _validate_and_normalize_sizes(n: int, ratios) -> tuple[int, int, int]:
@@ -26,7 +27,52 @@ def _validate_and_normalize_sizes(n: int, ratios) -> tuple[int, int, int]:
     return sizes[0], sizes[1], sizes[2]
 
 
-def _random_split(df, target, ratios, seed, stratify):
+def _check_min_samples(y, split_idx_map, min_samples, split_names=("train", "val", "test")):
+    """Check that every class has at least min_samples in every split.
+
+    split_idx_map is a dict like {"train": array, "val": array, "test": array}.
+    Raises ValueError with a diagnostic message if any class is too sparse.
+    """
+    if min_samples is None or min_samples <= 0:
+        return
+
+    problems = []
+    for name in split_names:
+        idx = split_idx_map[name]
+        if len(idx) == 0:
+            continue
+        counts = y.iloc[idx].value_counts(dropna=False)
+        for label, count in counts.items():
+            if count < min_samples:
+                problems.append(
+                    f"class {label!r} has only {count} sample(s) in {name} "
+                    f"(need at least {min_samples})"
+                )
+
+    # also check for classes completely missing from a split
+    all_classes = set(y.unique())
+    for name in split_names:
+        idx = split_idx_map[name]
+        if len(idx) == 0:
+            continue
+        present = set(y.iloc[idx].unique())
+        missing = all_classes - present
+        for label in missing:
+            problems.append(
+                f"class {label!r} has 0 samples in {name} "
+                f"(need at least {min_samples})"
+            )
+
+    if problems:
+        detail = "; ".join(problems[:5])
+        if len(problems) > 5:
+            detail += f" ... and {len(problems) - 5} more"
+        raise ValueError(
+            f"min_samples_per_class={min_samples} violated: {detail}"
+        )
+
+
+def _random_split(df, target, ratios, seed, stratify, min_samples_per_class):
     """Random (optionally stratified) train/val/test split."""
     n = len(df)
     rng = np.random.default_rng(seed)
@@ -90,6 +136,8 @@ def _random_split(df, target, ratios, seed, stratify):
         if len(np.unique(all_idx)) != n:
             raise RuntimeError("Internal error: stratified split produced overlap or missing indices.")
 
+    _check_min_samples(y, {"train": train_idx, "val": val_idx, "test": test_idx}, min_samples_per_class)
+
     metadata = {
         "strategy": "random",
         "ratios": tuple(ratios),
@@ -114,14 +162,7 @@ def _random_split(df, target, ratios, seed, stratify):
 
 
 def _group_split(df, groups, ratios, seed, balance_by="groups"):
-    """Split by group — no group appears in more than one split.
-
-    Parameters
-    ----------
-    balance_by : "groups" | "rows"
-        - "groups": allocate groups proportionally (default, original behavior)
-        - "rows": allocate groups so that row counts approximate the ratios
-    """
+    """Split by group, no group appears in more than one split."""
     unique_groups = np.asarray(df[groups].unique())
     n_groups = len(unique_groups)
 
@@ -170,16 +211,11 @@ def _group_split(df, groups, ratios, seed, balance_by="groups"):
 
 
 def _group_split_balance_rows(df, groups, shuffled_groups, ratios, rng):
-    """Assign groups to splits so that row counts approximate the requested ratios.
-
-    Uses a greedy allocation: sort groups by size descending, then assign each
-    group to the split whose current row count is furthest below its target.
-    """
+    """Assign groups to splits so row counts approximate the requested ratios."""
     n = len(df)
     group_col = df[groups]
     group_sizes = group_col.value_counts()
 
-    # Sort groups by size descending for greedy packing
     ordered = sorted(shuffled_groups, key=lambda g: -group_sizes[g])
 
     targets = {
@@ -192,15 +228,12 @@ def _group_split_balance_rows(df, groups, shuffled_groups, ratios, rng):
 
     for g in ordered:
         sz = group_sizes[g]
-        # Pick the split with largest remaining deficit
         best = max(targets, key=lambda s: targets[s] - current[s])
         assignments[best].append(g)
         current[best] += sz
 
-    # Ensure every split has at least one group
     for s in ["train", "val", "test"]:
         if not assignments[s]:
-            # Steal from the largest split
             donor = max(assignments, key=lambda k: len(assignments[k]))
             if len(assignments[donor]) >= 2:
                 moved = assignments[donor].pop()
@@ -218,12 +251,8 @@ def _group_split_balance_rows(df, groups, shuffled_groups, ratios, rng):
     return train_idx, val_idx, test_idx, groups_per_split
 
 
-def _stratified_group_split(df, groups, target, ratios, seed):
-    """Split by group with approximate class-balance preservation.
-
-    Uses a greedy assignment: for each group (shuffled), assign it to the split
-    whose current label distribution is furthest from the target distribution.
-    """
+def _stratified_group_split(df, groups, target, ratios, seed, min_samples_per_class=None):
+    """Split by group with approximate class-balance preservation."""
     unique_groups = np.asarray(df[groups].unique())
     n_groups = len(unique_groups)
     if n_groups < 3:
@@ -238,17 +267,14 @@ def _stratified_group_split(df, groups, target, ratios, seed):
     n = len(df)
     group_col = df[groups]
 
-    # Compute label distribution per group
     group_label_counts: dict = {}
     for g in shuffled:
         mask = group_col == g
         counts = y[mask].value_counts(dropna=False)
         group_label_counts[g] = {lab: int(counts.get(lab, 0)) for lab in labels}
 
-    # Target distribution (overall)
     overall_dist = y.value_counts(dropna=False, normalize=True).to_dict()
 
-    # Greedy assignment
     assignments: dict[str, list] = {"train": [], "val": [], "test": []}
     split_label_counts: dict[str, dict] = {
         s: {lab: 0 for lab in labels} for s in ["train", "val", "test"]
@@ -264,12 +290,10 @@ def _stratified_group_split(df, groups, target, ratios, seed):
         best_score = float("inf")
 
         for s in ["train", "val", "test"]:
-            # Score: how much adding this group moves the split toward ideal distribution
             new_total = split_totals[s] + g_total
             if new_total == 0:
                 score = 0.0
             else:
-                # Weighted: size deviation + distribution deviation
                 size_dev = abs(new_total - target_sizes[s]) / max(target_sizes[s], 1)
                 dist_dev = 0.0
                 for lab in labels:
@@ -288,7 +312,6 @@ def _stratified_group_split(df, groups, target, ratios, seed):
         for lab in labels:
             split_label_counts[best_split][lab] += g_counts.get(lab, 0)
 
-    # Ensure every split has at least one group
     for s in ["train", "val", "test"]:
         if not assignments[s]:
             donor = max(assignments, key=lambda k: len(assignments[k]))
@@ -299,6 +322,8 @@ def _stratified_group_split(df, groups, target, ratios, seed):
     train_idx = np.where(group_col.isin(set(assignments["train"])))[0].astype(int)
     val_idx = np.where(group_col.isin(set(assignments["val"])))[0].astype(int)
     test_idx = np.where(group_col.isin(set(assignments["test"])))[0].astype(int)
+
+    _check_min_samples(y, {"train": train_idx, "val": val_idx, "test": test_idx}, min_samples_per_class)
 
     metadata = {
         "strategy": "group",
@@ -328,23 +353,13 @@ def _stratified_group_split(df, groups, target, ratios, seed):
 
 
 def _time_split(df, time_col, ratios, seed, gap=0, embargo=0):
-    """Chronological split — train is earliest, test is latest.
-
-    Parameters
-    ----------
-    gap : int
-        Number of rows to drop between train/val and val/test boundaries.
-    embargo : int
-        Number of rows to drop after train and after val (purge window).
-        Alias for gap; if both are specified, the maximum is used.
-    """
+    """Chronological split with optional gap/embargo."""
     effective_gap = max(gap, embargo)
     n = len(df)
     time_series = pd.to_datetime(df[time_col])
     sorted_idx = np.argsort(time_series.values, kind="stable").astype(int)
 
-    # Account for gaps in size calculation
-    total_gap = 2 * effective_gap  # gap between train/val and val/test
+    total_gap = 2 * effective_gap
     usable = n - total_gap
     if usable < 3:
         raise ValueError(
@@ -355,10 +370,8 @@ def _time_split(df, time_col, ratios, seed, gap=0, embargo=0):
     train_n, val_n, test_n = _validate_and_normalize_sizes(usable, ratios)
 
     train_idx = sorted_idx[:train_n]
-    # Skip gap rows after train
     val_start = train_n + effective_gap
     val_idx = sorted_idx[val_start : val_start + val_n]
-    # Skip gap rows after val
     test_start = val_start + val_n + effective_gap
     test_idx = sorted_idx[test_start : test_start + test_n]
 
@@ -388,15 +401,7 @@ def _time_split(df, time_col, ratios, seed, gap=0, embargo=0):
 
 
 def _group_time_split(df, groups, time_col, ratios, seed, gap=0, embargo=0):
-    """Split groups by their latest timestamp — prevents entity + time leakage.
-
-    Parameters
-    ----------
-    gap : int
-        Number of groups to drop between train/val and val/test boundaries.
-    embargo : int
-        Alias for gap; if both specified, the maximum is used.
-    """
+    """Split groups by their latest timestamp with optional gap/embargo."""
     effective_gap = max(gap, embargo)
     time_series = pd.to_datetime(df[time_col])
     max_times = time_series.groupby(df[groups]).max()
@@ -469,6 +474,7 @@ def split(
     balance_by: str = "groups",
     gap: int = 0,
     embargo: int = 0,
+    min_samples_per_class: Optional[int] = None,
 ) -> SplitResult:
     """Split a DataFrame into train/val/test sets.
 
@@ -476,19 +482,18 @@ def split(
     ----------
     df : DataFrame
     target : target column name
-    groups : group column name (required for group/group_time strategies)
-    time_col : time column name (required for time/group_time strategies)
+    groups : group column (required for group/group_time strategies)
+    time_col : time column (required for time/group_time strategies)
     strategy : "random", "group", "time", or "group_time"
     ratios : (train, val, test) ratios summing to 1
     seed : random seed
-    stratify : whether to preserve class balance (None=auto for random, True/False explicit)
-    balance_by : "groups" or "rows" — for group strategy, whether to balance
-        group counts or row counts across splits
-    gap : number of rows (or groups for group_time) to drop between splits
-        as an embargo/purge window to prevent temporal leakage
-    embargo : alias for gap; if both given, max is used
+    stratify : whether to preserve class balance
+    balance_by : "groups" or "rows" for group strategy
+    gap : rows/groups to drop between splits (embargo/purge)
+    embargo : alias for gap
+    min_samples_per_class : minimum samples of each class required in every
+        split. Only checked for stratified splits. Raises ValueError if violated.
     """
-    # --- Input validation ---
     if not isinstance(df, pd.DataFrame):
         raise TypeError("df must be a pandas DataFrame")
 
@@ -520,9 +525,17 @@ def split(
     if balance_by not in ("groups", "rows"):
         raise ValueError(f"balance_by must be 'groups' or 'rows', got {balance_by!r}")
 
-    # --- Strategy dispatch ---
+    # Build reproducibility params dict
+    params = {
+        "target": target, "groups": groups, "time_col": time_col,
+        "strategy": strategy, "ratios": tuple(ratios), "seed": seed,
+        "stratify": stratify, "balance_by": balance_by,
+        "gap": gap, "embargo": embargo,
+        "min_samples_per_class": min_samples_per_class,
+    }
+
     if strategy == "random":
-        return _random_split(df, target, ratios, seed, stratify)
+        result = _random_split(df, target, ratios, seed, stratify, min_samples_per_class)
 
     elif strategy == "group":
         if groups is None:
@@ -530,8 +543,9 @@ def split(
         if groups not in df.columns:
             raise ValueError(f"groups column '{groups}' not found in dataframe")
         if stratify is True:
-            return _stratified_group_split(df, groups, target, ratios, seed)
-        return _group_split(df, groups, ratios, seed, balance_by=balance_by)
+            result = _stratified_group_split(df, groups, target, ratios, seed, min_samples_per_class)
+        else:
+            result = _group_split(df, groups, ratios, seed, balance_by=balance_by)
 
     elif strategy == "time":
         if stratify is True:
@@ -540,7 +554,7 @@ def split(
             raise ValueError("time_col parameter is required when strategy='time'")
         if time_col not in df.columns:
             raise ValueError(f"time_col column '{time_col}' not found in dataframe")
-        return _time_split(df, time_col, ratios, seed, gap=gap, embargo=embargo)
+        result = _time_split(df, time_col, ratios, seed, gap=gap, embargo=embargo)
 
     elif strategy == "group_time":
         if stratify is True:
@@ -551,7 +565,90 @@ def split(
             raise ValueError(f"groups column '{groups}' not found in dataframe")
         if time_col not in df.columns:
             raise ValueError(f"time_col column '{time_col}' not found in dataframe")
-        return _group_time_split(df, groups, time_col, ratios, seed, gap=gap, embargo=embargo)
+        result = _group_time_split(df, groups, time_col, ratios, seed, gap=gap, embargo=embargo)
 
     else:
         raise ValueError(f"Unknown strategy: {strategy!r}. Choose from: random, group, time, group_time")
+
+    # Enrich metadata with reproducibility info
+    repro = build_metadata(df, params)
+    result.metadata["reproducibility"] = repro
+
+    return result
+
+
+def repeated_split(
+    df,
+    target: str,
+    n_repeats: int = 10,
+    groups=None,
+    time_col=None,
+    strategy: str = "random",
+    ratios=(0.7, 0.15, 0.15),
+    seed: int = 42,
+    stratify: bool | None = None,
+    balance_by: str = "groups",
+    gap: int = 0,
+    embargo: int = 0,
+    min_samples_per_class: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run multiple holdout splits with different seeds and summarize stability.
+
+    Returns a dict with:
+        results: list of SplitResult objects
+        summary: variance and consistency statistics across repeats
+    """
+    if not isinstance(n_repeats, int) or n_repeats < 1:
+        raise ValueError("n_repeats must be a positive integer")
+
+    results: List[SplitResult] = []
+    for i in range(n_repeats):
+        r = split(
+            df, target=target, groups=groups, time_col=time_col,
+            strategy=strategy, ratios=ratios, seed=seed + i,
+            stratify=stratify, balance_by=balance_by,
+            gap=gap, embargo=embargo,
+            min_samples_per_class=min_samples_per_class,
+        )
+        results.append(r)
+
+    # Compute stability summary
+    train_sizes = [len(r.train_idx) for r in results]
+    val_sizes = [len(r.val_idx) for r in results]
+    test_sizes = [len(r.test_idx) for r in results]
+
+    summary: Dict[str, Any] = {
+        "n_repeats": n_repeats,
+        "strategy": strategy,
+        "seed_range": [seed, seed + n_repeats - 1],
+        "train_size": {"mean": float(np.mean(train_sizes)), "std": float(np.std(train_sizes))},
+        "val_size": {"mean": float(np.mean(val_sizes)), "std": float(np.std(val_sizes))},
+        "test_size": {"mean": float(np.mean(test_sizes)), "std": float(np.std(test_sizes))},
+    }
+
+    # If stratified, check class balance consistency
+    y = df[target]
+    categorical_like = (
+        pd.api.types.is_object_dtype(y)
+        or isinstance(y.dtype, pd.CategoricalDtype)
+        or pd.api.types.is_bool_dtype(y)
+        or int(y.nunique(dropna=False)) <= min(50, max(2, int(0.1 * len(df))))
+    )
+    if categorical_like:
+        train_prevalences = []
+        for r in results:
+            counts = y.iloc[r.train_idx].value_counts(dropna=False, normalize=True)
+            train_prevalences.append(counts.to_dict())
+
+        if train_prevalences:
+            all_labels = sorted(set(k for d in train_prevalences for k in d), key=str)
+            balance_stats = {}
+            for label in all_labels:
+                vals = [d.get(label, 0.0) for d in train_prevalences]
+                balance_stats[str(label)] = {
+                    "mean": round(float(np.mean(vals)), 4),
+                    "std": round(float(np.std(vals)), 4),
+                }
+            summary["train_class_balance"] = balance_stats
+
+    return {"results": results, "summary": summary}
